@@ -1,0 +1,154 @@
+name: PR Auto Fix and Check
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-fix:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10.14.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Prettier format
+        id: prettier
+        run: |
+          pnpm format
+          if [[ -n $(git diff --name-only) ]]; then
+            echo "formatted=true" >> $GITHUB_OUTPUT
+            echo "### ✨ Prettierフォーマットを適用しました" >> $GITHUB_STEP_SUMMARY
+            echo "以下のファイルがフォーマットされました:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            git diff --name-only >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "formatted=false" >> $GITHUB_OUTPUT
+            echo "### ✅ コードは既にフォーマット済みです" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Run ESLint check
+        id: eslint-check
+        run: |
+          if pnpm lint; then
+            echo "lint_errors=false" >> $GITHUB_OUTPUT
+            echo "### ✅ ESLintエラーはありません" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "lint_errors=true" >> $GITHUB_OUTPUT
+            echo "### ⚠️ ESLintエラーが見つかりました" >> $GITHUB_STEP_SUMMARY
+            echo "自動修正を試みています..." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Run ESLint auto-fix
+        id: eslint-fix
+        if: steps.eslint-check.outputs.lint_errors == 'true'
+        run: |
+          pnpm lint:fix
+          if [[ -n $(git diff --name-only) ]]; then
+            echo "fixed=true" >> $GITHUB_OUTPUT
+            echo "### 🔧 ESLint自動修正を適用しました" >> $GITHUB_STEP_SUMMARY
+            echo "以下のファイルが修正されました:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            git diff --name-only >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "fixed=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Check if there are still errors after auto-fix
+          if pnpm lint; then
+            echo "remaining_errors=false" >> $GITHUB_OUTPUT
+            echo "### ✅ すべてのESLintエラーが自動修正されました" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "remaining_errors=true" >> $GITHUB_OUTPUT
+            echo "### ❌ 一部のESLintエラーは自動修正できませんでした" >> $GITHUB_STEP_SUMMARY
+            echo "ローカルで \`pnpm lint\` を実行してエラーを確認し、手動で修正してください。" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Commit and push changes
+        if: steps.prettier.outputs.formatted == 'true' || steps.eslint-fix.outputs.fixed == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: フォーマットとリントの問題を自動修正"
+          git push
+
+      - name: Comment PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = [];
+            const prettierFormatted = '${{ steps.prettier.outputs.formatted }}' === 'true';
+            const eslintErrors = '${{ steps.eslint-check.outputs.lint_errors }}' === 'true';
+            const eslintFixed = '${{ steps.eslint-fix.outputs.fixed }}' === 'true';
+            const remainingErrors = '${{ steps.eslint-fix.outputs.remaining_errors }}' === 'true';
+
+            if (prettierFormatted || eslintFixed) {
+              output.push('## 🤖 自動修正レポート');
+              output.push('');
+              
+              if (prettierFormatted) {
+                output.push('### ✨ Prettier');
+                output.push('コードのフォーマットが自動的に適用されました。');
+                output.push('');
+              }
+              
+              if (eslintFixed) {
+                output.push('### 🔧 ESLint');
+                output.push('一部のESLintの問題が自動的に修正されました。');
+                output.push('');
+              }
+              
+              output.push('**変更は自動的にコミットされ、ブランチにプッシュされました。**');
+              output.push('');
+            }
+
+            if (remainingErrors) {
+              output.push('### ❌ 手動修正が必要です');
+              output.push('一部のESLintエラーは自動的に修正できませんでした。');
+              output.push('ローカルで `pnpm lint` を実行してエラーを確認し、手動で修正してください。');
+              output.push('');
+            } else if (!prettierFormatted && !eslintErrors) {
+              output.push('## ✅ すべてのチェックに合格しました');
+              output.push('コードは適切にフォーマットされており、リントエラーもありません！');
+            }
+
+            if (output.length > 0) {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output.join('\n')
+              });
+            }
+
+      - name: Fail if unfixable errors remain
+        if: steps.eslint-fix.outputs.remaining_errors == 'true'
+        run: |
+          echo "::error::一部のESLintエラーは自動的に修正できませんでした。手動で修正してください。"
+          exit 1
